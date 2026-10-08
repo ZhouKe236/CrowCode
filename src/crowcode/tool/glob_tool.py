@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from crowcode.tool import DEFAULT_TIMEOUT, Result, _parse_args
+from .base import DEFAULT_TIMEOUT, Result, _parse_args
 
 _MAX_RESULTS = 100
 

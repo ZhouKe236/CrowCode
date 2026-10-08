@@ -6,7 +6,7 @@ import asyncio
 import re
 from pathlib import Path
 
-from crowcode.tool import DEFAULT_TIMEOUT, Result, _parse_args
+from .base import DEFAULT_TIMEOUT, Result, _parse_args
 
 _MAX_HITS = 100
 _MAX_LINE_CHARS = 1024 * 1024  # 单行超过约 1MB 视为超长行

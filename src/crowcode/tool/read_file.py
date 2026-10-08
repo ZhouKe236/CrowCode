@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from crowcode.tool import DEFAULT_TIMEOUT, Result, _parse_args, _truncate
+from .base import DEFAULT_TIMEOUT, Result, _parse_args, _truncate
 
 _MAX_LINES = 2000
 _MAX_CHARS = 256 * 1024

@@ -1,10 +1,12 @@
-"""入口：加载配置、启动 TUI。"""
+"""入口：加载配置、构造权限引擎、启动 TUI。"""
 
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from crowcode.config import ConfigError, load
+from crowcode.permission import new_engine
 from crowcode.tool import new_default_registry
 from crowcode.tui import run
 
@@ -27,9 +29,12 @@ def _force_utf8() -> None:
 def main() -> None:
     _force_utf8()
     try:
-        # cfg = load(".crowcode/config.yaml")
-        cfg = load("D:\develop\code\codePython\crowcode\.crowcode\config.yaml")
+        cfg = load(".crowcode/config.yaml")
     except ConfigError as e:
         print(e, file=sys.stderr)
         sys.exit(1)
-    run(cfg.providers, new_default_registry())
+    root = str(Path.cwd().resolve())
+    engine, err = new_engine(root)
+    if err is not None:
+        print("Warning: permission engine degraded:", err, file=sys.stderr)
+    run(cfg.providers, new_default_registry(), engine)

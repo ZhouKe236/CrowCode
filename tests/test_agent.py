@@ -1,6 +1,8 @@
 """agent ReAct 循环单测（用 fake provider 驱动，不联网）。"""
 
 import asyncio
+import json
+import tempfile
 
 import pytest
 
@@ -11,16 +13,23 @@ from crowcode.agent import (
     NOTICE_MAX_ITER,
     NOTICE_UNKNOWN_TOOLS,
     Agent,
-    Mode,
     Phase,
 )
 from crowcode.conversation import Conversation
 from crowcode.llm import StreamEvent, ToolCall
 from crowcode.llm import Usage as LLMUsage
+from crowcode.permission import Mode, Outcome, new_engine
 from crowcode.prompt import plan_reminder
 from crowcode.tool import Registry, Result, new_default_registry
 
 _VERSION = "0.1.0"  # 测试用应用版本
+
+
+def _engine(tmp_path=None):
+    """构造一个根于临时目录的空规则引擎。"""
+    root = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp()
+    engine, _ = new_engine(root)
+    return engine
 
 
 def text(s: str) -> StreamEvent:
@@ -64,6 +73,28 @@ class FakeTool:
     async def execute(self, args: str, timeout: float = 30.0) -> Result:
         self.calls += 1
         return Result(content="内容", is_error=False)
+
+
+class FakeWriteTool:
+    """假写工具（read_only=False）：记录执行次数，不落地文件。"""
+
+    read_only = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def name(self) -> str:
+        return "write_file"
+
+    def description(self) -> str:
+        return "fake write"
+
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {"path": {"type": "string"}}}
+
+    async def execute(self, args: str, timeout: float = 30.0) -> Result:
+        self.calls += 1
+        return Result(content="已写入", is_error=False)
 
 
 class FakeProvider:
@@ -123,8 +154,8 @@ async def test_multi_round_chain():
     conv.add_user("读文件")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.DEFAULT, asyncio.Event()
         )
     ]
 
@@ -156,8 +187,8 @@ async def test_iteration_limit():
     conv.add_user("反复干活")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.DEFAULT, asyncio.Event()
         )
     ]
 
@@ -178,8 +209,8 @@ async def test_unknown_tools_stop():
     conv.add_user("x")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -204,8 +235,8 @@ async def test_unknown_tools_reset_on_known():
     conv.add_user("x")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -289,8 +320,8 @@ async def test_concurrent_batch():
     conv.add_user("做三件事")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -345,10 +376,10 @@ async def test_cancel_history_consistent():
     conv = Conversation()
     conv.add_user("跑慢工具")
     cancel = asyncio.Event()
-    agent = Agent(provider, registry, _VERSION)
+    agent = Agent(provider, registry, _VERSION, _engine())
 
     async def drive() -> None:
-        async for ev in agent.run(conv, Mode.NORMAL, cancel):
+        async for ev in agent.run(conv, Mode.BYPASS, cancel):
             if ev.tool is not None and ev.tool.phase is Phase.START:
                 await asyncio.sleep(0.05)
                 cancel.set()
@@ -366,8 +397,8 @@ async def test_cancel_history_consistent():
     # 追加一轮纯文本能正常跑（角色交替未坏）。
     events2 = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.BYPASS, asyncio.Event()
         )
     ]
     assert any(e.done for e in events2)
@@ -385,7 +416,7 @@ async def test_plan_mode_read_only_tools():
     conv.add_user("给方案")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
             conv, Mode.PLAN, asyncio.Event()
         )
     ]
@@ -410,15 +441,15 @@ async def test_system_prompt_two_segments_consistent_across_modes():
     conv.add_user("x")
     [
         ev
-        async for ev in Agent(normal_provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(normal_provider, registry, _VERSION, _engine()).run(
+            conv, Mode.DEFAULT, asyncio.Event()
         )
     ]
     conv2 = Conversation()
     conv2.add_user("x")
     [
         ev
-        async for ev in Agent(plan_provider, registry, _VERSION).run(
+        async for ev in Agent(plan_provider, registry, _VERSION, _engine()).run(
             conv2, Mode.PLAN, asyncio.Event()
         )
     ]
@@ -444,7 +475,7 @@ async def test_plan_mode_reminder_per_iteration_and_not_persisted():
     conv.add_user("做个计划")
     [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
             conv, Mode.PLAN, asyncio.Event()
         )
     ]
@@ -473,8 +504,8 @@ async def test_cache_usage_passthrough():
     conv.add_user("x")
     events = [
         ev
-        async for ev in Agent(provider, registry, _VERSION).run(
-            conv, Mode.NORMAL, asyncio.Event()
+        async for ev in Agent(provider, registry, _VERSION, _engine()).run(
+            conv, Mode.DEFAULT, asyncio.Event()
         )
     ]
 
@@ -483,3 +514,170 @@ async def test_cache_usage_passthrough():
     assert u.output == 10
     assert u.cache_write == 30
     assert u.cache_read == 20
+
+
+# ── 权限集成：Deny 回灌不中断 / 保序 / Ask / 永久 / 只读并发 / 取消 ──
+
+
+@pytest.mark.asyncio
+async def test_permission_deny_loop_continues(tmp_path):
+    """沙箱外写文件被 Deny，结果回灌错误，Loop 继续到次轮（AC11/F9）。"""
+    engine, _ = new_engine(str(tmp_path))
+    registry = new_default_registry()
+    provider = FakeProvider(
+        [
+            [
+                tc(
+                    "write_file",
+                    input=json.dumps({"path": "/etc/passwd", "content": "x"}),
+                ),
+                done(),
+            ],
+            [text("改项目内路径重试"), done()],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("写文件")
+    events = [
+        ev
+        async for ev in Agent(provider, registry, _VERSION, engine).run(
+            conv, Mode.DEFAULT, asyncio.Event()
+        )
+    ]
+
+    msgs = conv.messages()
+    tool_msg = next(m for m in msgs if m.role == "tool")
+    assert tool_msg.tool_results[0].is_error is True
+    assert "项目目录之外" in tool_msg.tool_results[0].content
+    assert any(e.text == "改项目内路径重试" for e in events)  # Loop 继续
+
+
+@pytest.mark.asyncio
+async def test_permission_mixed_batch_ordering(tmp_path):
+    """只读批中「被沙箱拒 + 放行」按调用序配对回灌、互不串位（AC11/N3）。"""
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    engine, _ = new_engine(str(tmp_path))
+    registry = new_default_registry()
+    calls = [
+        ToolCall(id="c1", name="read_file", input=json.dumps({"path": "/etc/passwd"})),
+        ToolCall(
+            id="c2",
+            name="read_file",
+            input=json.dumps({"path": str(tmp_path / "a.txt")}),
+        ),
+    ]
+    provider = FakeProvider(
+        [[StreamEvent(tool_calls=calls), done()], [text("ok"), done()]]
+    )
+    conv = Conversation()
+    conv.add_user("读两个文件")
+    approvals = [
+        ev
+        async for ev in Agent(provider, registry, _VERSION, engine).run(
+            conv, Mode.DEFAULT, asyncio.Event()
+        )
+        if ev.approval is not None
+    ]
+    assert approvals == []  # 只读永不 Ask
+
+    tool_msg = next(m for m in conv.messages() if m.role == "tool")
+    results = tool_msg.tool_results
+    assert [r.tool_call_id for r in results] == ["c1", "c2"]
+    assert results[0].is_error is True
+    assert results[1].is_error is False
+
+
+@pytest.mark.asyncio
+async def test_permission_ask_allow_once(tmp_path):
+    tool = FakeWriteTool()
+    registry = Registry()
+    registry.register(tool)
+    engine, _ = new_engine(str(tmp_path))
+    provider = FakeProvider(
+        [
+            [tc("write_file", input='{"path": "a.txt", "content": "x"}'), done()],
+            [text("完成"), done()],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("写文件")
+    saw_ask = False
+    async for ev in Agent(provider, registry, _VERSION, engine).run(
+        conv, Mode.DEFAULT, asyncio.Event()
+    ):
+        if ev.approval is not None:
+            saw_ask = True
+            assert ev.approval.name == "write_file"
+            ev.approval.respond.set_result(Outcome.ALLOW_ONCE)
+
+    assert saw_ask is True
+    assert tool.calls == 1  # 允许本次后执行
+
+
+@pytest.mark.asyncio
+async def test_permission_ask_deny_once(tmp_path):
+    tool = FakeWriteTool()
+    registry = Registry()
+    registry.register(tool)
+    engine, _ = new_engine(str(tmp_path))
+    provider = FakeProvider(
+        [[tc("write_file", input='{"path": "a.txt"}'), done()], [text("好"), done()]]
+    )
+    conv = Conversation()
+    conv.add_user("写文件")
+    async for ev in Agent(provider, registry, _VERSION, engine).run(
+        conv, Mode.DEFAULT, asyncio.Event()
+    ):
+        if ev.approval is not None:
+            ev.approval.respond.set_result(Outcome.DENY_ONCE)
+
+    assert tool.calls == 0  # 拒绝本次不执行
+    tool_msg = next(m for m in conv.messages() if m.role == "tool")
+    assert tool_msg.tool_results[0].is_error is True
+
+
+@pytest.mark.asyncio
+async def test_permission_ask_allow_forever(tmp_path):
+    tool = FakeWriteTool()
+    registry = Registry()
+    registry.register(tool)
+    engine, _ = new_engine(str(tmp_path))
+    provider = FakeProvider(
+        [[tc("write_file", input='{"path": "a.txt"}'), done()], [text("好"), done()]]
+    )
+    conv = Conversation()
+    conv.add_user("写文件")
+    async for ev in Agent(provider, registry, _VERSION, engine).run(
+        conv, Mode.DEFAULT, asyncio.Event()
+    ):
+        if ev.approval is not None:
+            ev.approval.respond.set_result(Outcome.ALLOW_FOREVER)
+
+    assert tool.calls == 1  # 永久也执行
+    assert (tmp_path / ".crowcode" / "settings.local.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_permission_cancel_during_approval(tmp_path):
+    tool = FakeWriteTool()
+    registry = Registry()
+    registry.register(tool)
+    engine, _ = new_engine(str(tmp_path))
+    provider = FakeProvider(
+        [[tc("write_file", input='{"path": "a.txt"}'), done()], [text("继续"), done()]]
+    )
+    conv = Conversation()
+    conv.add_user("写文件")
+    cancel = asyncio.Event()
+    agent = Agent(provider, registry, _VERSION, engine)
+
+    async def drive() -> None:
+        async for ev in agent.run(conv, Mode.DEFAULT, cancel):
+            if ev.approval is not None:
+                # 模拟用户在待批准态按 Esc：兜底 DENY_ONCE + 取消本轮
+                ev.approval.respond.set_result(Outcome.DENY_ONCE)
+                cancel.set()
+
+    await drive()
+    assert tool.calls == 0
+    assert conv.last_role() == "assistant"

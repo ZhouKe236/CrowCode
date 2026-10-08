@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from crowcode.tool import DEFAULT_TIMEOUT, Result, _parse_args
+from .base import DEFAULT_TIMEOUT, Result, _parse_args
 
 
 class EditFileTool:

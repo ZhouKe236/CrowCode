@@ -1,4 +1,4 @@
-"""终端层：Textual App，承载选择 / 对话 / 流式 / 工具行 / 错误的全部交互。"""
+"""终端层：Textual App，承载选择 / 对话 / 流式 / 工具行 / 待批准 / 错误的全部交互。"""
 
 from __future__ import annotations
 
@@ -19,17 +19,21 @@ from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from crowcode import __version__
-from crowcode.agent import Agent, Mode, Phase
+from crowcode.agent import Agent, ApprovalRequest, Phase
 from crowcode.config import ProviderConfig
 from crowcode.conversation import Conversation
 from crowcode.llm import Provider, new_provider
+from crowcode.permission import Engine, Mode, Outcome
 from crowcode.prompt import EXECUTE_DIRECTIVE
 from crowcode.tool import Registry
 
 from .select import build_provider_options
 from .view import (
+    approval_block,
     assistant_markdown,
     error_block,
+    mode_status,
+    model_status,
     render_header,
     system_block,
     tool_line,
@@ -42,6 +46,16 @@ class SessionState(Enum):
     SELECTING = "selecting"  # 多 provider 时的选择界面
     IDLE = "idle"  # 等待用户输入
     STREAMING = "streaming"  # 等待 / 接收模型流
+    APPROVING = "approving"  # 人在回路：等待用户三选一
+
+
+# 待批准菜单下标 → Outcome（0=允许本次、1=永久、2=拒绝本次）。
+_APPROVAL_OUTCOMES = (Outcome.ALLOW_ONCE, Outcome.ALLOW_FOREVER, Outcome.DENY_ONCE)
+
+
+def next_mode(m: Mode) -> Mode:
+    """Shift+Tab 循环：DEFAULT → ACCEPT_EDITS → PLAN → BYPASS → DEFAULT。"""
+    return Mode((int(m) + 1) % 4)
 
 
 @dataclass
@@ -87,27 +101,37 @@ class CrowCodeApp(App):
     #log { height: 1fr; padding: 0 1; background: transparent; }
     #streaming { height: auto; min-height: 1; padding: 0 1; }
     #input-row { height: auto; border-top: solid $primary; padding: 1; }
+    #status-bar { height: auto; border-top: solid $primary; padding: 0 1; }
+    #mode-label { width: auto; }
+    #model-info { width: 1fr; content-align: right middle; }
     #prompt { width: 2; color: green; }
     #input { width: 1fr; height: auto; min-height: 1; max-height: 8; border: none; padding: 0 1; }
     #options { height: 1fr; }
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("ctrl+c", "interrupt", "中断/退出", priority=True),
-        Binding("escape", "cancel", "取消本轮", priority=True),
+        Binding("ctrl+c", "interrupt", "Quit", priority=True),
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("shift+tab", "cycle_mode", "Cycle mode", priority=True),
     ]
 
-    def __init__(self, providers: list[ProviderConfig], registry: Registry) -> None:
+    def __init__(
+        self,
+        providers: list[ProviderConfig],
+        registry: Registry,
+        engine: Engine,
+    ) -> None:
         super().__init__()
         self.providers = providers
         # 命名 _tool_registry 而非 _registry：后者是 Textual App 内部 DOM 注册表，冲突。
         self._tool_registry = registry
+        self.engine = engine
         self.provider: Provider | None = None
         self.conv = Conversation()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
-        self.mode: Mode = Mode.NORMAL
+        self.mode: Mode = engine.start_mode
         self.iter: int = 0
         self.usage_in: int = 0
         self.usage_out: int = 0
@@ -116,6 +140,9 @@ class CrowCodeApp(App):
         self._stream_task: asyncio.Task | None = None
         self._timer: Timer | None = None
         self._input: ChatInput | None = None
+        # 人在回路待批准请求与菜单光标。
+        self.pending: ApprovalRequest | None = None
+        self.approve_cursor: int = 0
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header")
@@ -129,6 +156,9 @@ class CrowCodeApp(App):
                 soft_wrap=True,
                 show_line_numbers=False,
             )
+        with Horizontal(id="status-bar"):
+            yield Static("", id="mode-label")
+            yield Static("", id="model-info")
         yield OptionList(*build_provider_options(self.providers), id="options")
 
     def on_mount(self) -> None:
@@ -140,6 +170,8 @@ class CrowCodeApp(App):
         else:
             self.provider = new_provider(self.providers[0])
             self._render_header()
+            self._update_mode_label()
+            self._update_model_info()
             self._set_selecting(False)
 
     # ── provider 选择 ──────────────────────────────────────────────
@@ -148,6 +180,8 @@ class CrowCodeApp(App):
         self.provider = new_provider(self.providers[event.option_index])
         self.state = SessionState.IDLE
         self._render_header()
+        self._update_mode_label()
+        self._update_model_info()
         self._set_selecting(False)
         if self._input is not None:
             self._input.focus()
@@ -165,14 +199,14 @@ class CrowCodeApp(App):
 
         if text == "/plan":
             self.mode = Mode.PLAN
-            log.write(system_block("已进入计划模式（仅只读工具）。"))
-            self._render_header()
+            log.write(system_block("Entered plan mode (read-only tools)."))
+            self._update_mode_label()
             return
         if text == "/do":
-            self.mode = Mode.NORMAL
-            log.write(system_block("已切换回普通模式，按计划开始执行。"))
+            self.mode = Mode.DEFAULT
+            log.write(system_block("Switched back to default mode, executing the plan."))
             self.conv.add_user(EXECUTE_DIRECTIVE)
-            self._render_header()
+            self._update_mode_label()
         else:
             self.conv.add_user(text)
             log.write(user_block(text))
@@ -193,10 +227,19 @@ class CrowCodeApp(App):
     async def _consume_agent_events(self) -> None:
         assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(self.provider, self._tool_registry, __version__)
+        agent = Agent(self.provider, self._tool_registry, __version__, self.engine)
         log = self.query_one("#log", RichLog)
         try:
             async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
+                if ev.approval is not None:
+                    # 人在回路：进入待批准态，暂停读取后续事件（agent 正 await respond）。
+                    self.pending = ev.approval
+                    self.approve_cursor = 0
+                    self.state = SessionState.APPROVING
+                    self._refresh_approval()
+                    if self._input is not None:
+                        self._input.blur()
+                    continue
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
                     return
@@ -258,9 +301,15 @@ class CrowCodeApp(App):
                 out.append(lines, style="bold cyan")
             else:
                 elapsed = int(time.monotonic() - self.turn_start)
-                iter_suffix = f" · 第 {self.iter} 轮" if self.iter > 0 else ""
+                iter_suffix = f" · round {self.iter}" if self.iter > 0 else ""
                 out.append(f"Imagining… ({elapsed}s{iter_suffix})")
         self.query_one("#streaming", Static).update(out)
+
+    def _refresh_approval(self) -> None:
+        if self.pending is not None:
+            self.query_one("#streaming", Static).update(
+                approval_block(self.pending, self.approve_cursor)
+            )
 
     def _finish_with_error(self, err: Exception) -> None:
         self.query_one("#log", RichLog).write(error_block(err))
@@ -275,43 +324,98 @@ class CrowCodeApp(App):
         self.cur_tools = []
         self.iter = 0
         self.turn_cancel = None
+        self.pending = None
+        self.approve_cursor = 0
         self.state = SessionState.IDLE
+        if self._input is not None:
+            self._input.focus()
         self._refresh_streaming_view()
+
+    # ── 人在回路 ──────────────────────────────────────────────────
+
+    def action_cycle_mode(self) -> None:
+        """Shift+Tab：仅空闲态循环切换权限模式。"""
+        if self.state is SessionState.IDLE:
+            self._cycle_mode()
+
+    def _cycle_mode(self) -> None:
+        self.mode = next_mode(self.mode)
+        self._update_mode_label()
+
+    def _approve_choose(self, index: int) -> None:
+        self._resolve_approval(_APPROVAL_OUTCOMES[index])
+        self._refresh_streaming_view()
+
+    def _resolve_approval(self, outcome: Outcome) -> None:
+        pending = self.pending
+        self.pending = None
+        self.approve_cursor = 0
+        self.state = SessionState.STREAMING
+        if pending is not None and not pending.respond.done():
+            pending.respond.set_result(outcome)
 
     # ── 状态栏与显示切换 ──────────────────────────────────────────
 
     def _render_header(self) -> None:
         model = self.provider.model if self.provider is not None else None
         self.query_one("#header", Static).update(
-            render_header(
-                __version__,
-                os.getcwd(),
-                model,
-                self.mode is Mode.PLAN,
-                self.usage_in,
-                self.usage_out,
-            )
+            render_header(__version__, os.getcwd(), model, self.usage_in, self.usage_out)
         )
+
+    def _update_mode_label(self) -> None:
+        self.query_one("#mode-label", Static).update(mode_status(self.mode))
+
+    def _update_model_info(self) -> None:
+        model = self.provider.model if self.provider is not None else None
+        self.query_one("#model-info", Static).update(model_status(model))
 
     def _set_selecting(self, selecting: bool) -> None:
         chat_display = "none" if selecting else "block"
-        for wid in ("#header", "#log", "#streaming", "#input-row"):
+        for wid in ("#header", "#log", "#streaming", "#input-row", "#status-bar"):
             self.query_one(wid).styles.display = chat_display
         self.query_one("#options").styles.display = "block" if selecting else "none"
 
     # ── 按键与退出 ────────────────────────────────────────────────
 
+    def on_key(self, event: events.Key) -> None:
+        # 待批准态：光标移动 + 三选一（Esc/Ctrl+C 走全局 Binding）。
+        if self.state is SessionState.APPROVING:
+            if event.key in ("up", "k"):
+                self.approve_cursor = (self.approve_cursor - 1) % 3
+                self._refresh_approval()
+            elif event.key in ("down", "j"):
+                self.approve_cursor = (self.approve_cursor + 1) % 3
+                self._refresh_approval()
+            elif event.key in ("enter", "space"):
+                self._approve_choose(self.approve_cursor)
+            elif event.key in ("1", "2", "3"):
+                self._approve_choose(int(event.key) - 1)
+            elif event.key == "y":
+                self._approve_choose(0)
+            elif event.key in ("n", "d"):
+                self._approve_choose(2)
+            else:
+                return
+            event.prevent_default()
+            event.stop()
+
     def action_interrupt(self) -> None:
-        """Ctrl+C：流式态取消本轮（不退出）；空闲态退出程序。"""
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
-            self.turn_cancel.set()
+        """Ctrl+C：流式/待批准态取消本轮（不退出）；空闲态退出程序。"""
+        if self.state in (SessionState.STREAMING, SessionState.APPROVING):
+            if self.state is SessionState.APPROVING:
+                self._resolve_approval(Outcome.DENY_ONCE)
+            if self.turn_cancel is not None:
+                self.turn_cancel.set()
         else:
             self.exit()
 
     def action_cancel(self) -> None:
-        """Esc：流式态取消本轮；其余忽略。"""
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
-            self.turn_cancel.set()
+        """Esc：流式/待批准态取消本轮；其余忽略。"""
+        if self.state in (SessionState.STREAMING, SessionState.APPROVING):
+            if self.state is SessionState.APPROVING:
+                self._resolve_approval(Outcome.DENY_ONCE)
+            if self.turn_cancel is not None:
+                self.turn_cancel.set()
 
     async def action_quit(self) -> None:
         if self._stream_task is not None:
@@ -319,6 +423,10 @@ class CrowCodeApp(App):
         self.exit()
 
 
-def run(providers: list[ProviderConfig], registry: Registry) -> None:
+def run(
+    providers: list[ProviderConfig],
+    registry: Registry,
+    engine: Engine,
+) -> None:
     """启动 CrowCode TUI。"""
-    CrowCodeApp(providers, registry).run()
+    CrowCodeApp(providers, registry, engine).run()

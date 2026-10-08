@@ -9,7 +9,8 @@ from collections.abc import AsyncIterator
 import anthropic
 
 from crowcode.config import ProviderConfig
-from crowcode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+
+from .base import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict]:

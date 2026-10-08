@@ -1,4 +1,4 @@
-"""渲染辅助：头部 logo、用户块、助手 markdown、错误块、工具行。"""
+"""渲染辅助：头部 logo、用户块、助手 markdown、错误块、工具行、待批准块。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
+from crowcode.agent import ApprovalRequest
+from crowcode.permission import Mode
 from crowcode.prompt import CROW_BANNER
 
 
@@ -17,36 +19,64 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+_MODE_LABELS = {
+    Mode.DEFAULT: "DEFAULT",
+    Mode.ACCEPT_EDITS: "ACCEPT EDITS",
+    Mode.PLAN: "PLAN",
+    Mode.BYPASS: "BYPASS",
+}
+
+_MODE_STYLES = {
+    Mode.DEFAULT: "green",
+    Mode.ACCEPT_EDITS: "cyan",
+    Mode.PLAN: "yellow",
+    Mode.BYPASS: "red",
+}
+
+
+def mode_status(mode: Mode) -> Text:
+    """状态栏左下角常驻的权限模式标签；非默认档追加 shift+tab 切换提示。"""
+    out = Text(f"[{_MODE_LABELS[mode]}]", style=_MODE_STYLES[mode])
+    if mode is not Mode.DEFAULT:
+        out.append("  (shift+tab to cycle)", style="dim")
+    return out
+
+
 def render_header(
     version: str,
     cwd: str,
     model: str | None,
-    plan: bool = False,
     usage_in: int = 0,
     usage_out: int = 0,
 ) -> Text:
-    """头部 logo：蓝色乌鸦，右侧分行显示版本 / 模型（含模式徽标）/ 用量 / 项目路径。"""
+    """头部 logo：蓝色乌鸦，右侧分行显示版本 / 模型 / 用量 / 项目路径。"""
     crow_lines = CROW_BANNER.splitlines()
     crow_width = max(len(line) for line in crow_lines)
-    model_line = f"{model}" if model else "model: —"
-    if plan:
-        model_line += "  [PLAN]"
-    info_lines = [
-        "",
-        f"Crow Code v{version}",
+    model_line = Text(model if model else "model: —", style="grey93 dim")
+    info_lines: list[Text] = [
+        Text(),
+        Text(f"Crow Code v{version}", style="grey93 dim"),
         model_line,
-        f"↑{_fmt_tokens(usage_in)} ↓{_fmt_tokens(usage_out)} tok",
-        f"{cwd}",
+        Text(
+            f"↑{_fmt_tokens(usage_in)} ↓{_fmt_tokens(usage_out)} tok",
+            style="grey93 dim",
+        ),
+        Text(f"{cwd}", style="grey93 dim"),
     ]
     out = Text()
     for i in range(max(len(crow_lines), len(info_lines))):
         if i:
             out.append("\n")
         crow_part = crow_lines[i] if i < len(crow_lines) else ""
-        out.append(crow_part.ljust(crow_width + 2), style="bold blue")
-        info_part = info_lines[i] if i < len(info_lines) else ""
-        out.append(info_part, style="grey93 dim")
+        out.append(crow_part.ljust(crow_width + 4), style="bold blue")
+        out.append(info_lines[i] if i < len(info_lines) else Text())
     return out
+
+
+def model_status(model: str | None) -> Text:
+    """状态栏右侧：模型名"""
+    name = model if model else "—"
+    return Text(name, style="grey93 dim")
 
 
 def user_block(text: str) -> Text:
@@ -67,7 +97,7 @@ def error_block(err: Exception) -> Text:
 
 
 def system_block(text: str) -> Text:
-    """系统提示块：灰色斜体，用于 /plan /do 提示与停止通知。"""
+    """系统提示块：灰色斜体，用于 /plan /do 提示、模式切换与停止通知。"""
     return Text("— " + text, style="dim italic")
 
 
@@ -90,3 +120,27 @@ def tool_result_summary(result: str, is_error: bool) -> RenderableType:
     """工具结果摘要：缩进 ⎿ 前缀，红色（错误）/ 灰色（正常），UI 截断约 8 行。"""
     style = "red" if is_error else "dim"
     return Padding(Text("⎿ " + _clip_lines(result, 8), style=style), (0, 0, 0, 2))
+
+
+_APPROVAL_OPTIONS = (
+    "Allow this once",
+    "Allow forever (write to local config)",
+    "Deny this once",
+)
+
+
+def approval_block(req: ApprovalRequest, cursor: int) -> Text:
+    """人在回路待批准块：工具名 + 参数预览 + 触发原因 + 三选菜单（光标高亮）。"""
+    out = Text()
+    out.append("● ", style="bold yellow")
+    out.append(f"{req.name}({req.args})\n", style="bold")
+    out.append("Reason: ", style="dim italic")
+    out.append(f"{req.reason}\n", style="dim")
+    out.append("Continue?\n", style="bold")
+    for idx, label in enumerate(_APPROVAL_OPTIONS):
+        if idx == cursor:
+            out.append(f"> {idx + 1}. {label}\n", style="bold green")
+        else:
+            out.append(f"  {idx + 1}. {label}\n", style="dim")
+    out.append("↑↓ select · Enter confirm · 1/2/3 · Esc cancel", style="dim")
+    return out

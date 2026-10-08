@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from crowcode.llm import (
     ROLE_ASSISTANT,
+    ROLE_USER,
     ROLE_TOOL,
     Message,
     ToolCall,
@@ -16,10 +17,10 @@ class Conversation:
         self._messages: list[Message] = []
 
     def add_user(self, text: str) -> None:
-        self._messages.append(Message(role="user", content=text))
+        self._messages.append(Message(role=ROLE_USER, content=text))
 
     def add_assistant(self, text: str) -> None:
-        self._messages.append(Message(role="assistant", content=text))
+        self._messages.append(Message(role=ROLE_ASSISTANT, content=text))
 
     def add_assistant_with_tool_calls(self, text: str, calls: list[ToolCall]) -> None:
         """assistant 工具调用回合。"""

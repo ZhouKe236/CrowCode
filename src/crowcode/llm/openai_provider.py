@@ -8,7 +8,8 @@ from collections.abc import AsyncIterator
 import openai
 
 from crowcode.config import ProviderConfig
-from crowcode.llm import Request, StreamEvent, ToolCall, ToolDefinition, Usage
+
+from .base import Request, StreamEvent, ToolCall, ToolDefinition, Usage
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict]:

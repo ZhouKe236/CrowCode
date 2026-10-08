@@ -1,4 +1,4 @@
 .claude/
 CLAUDE.md
 .crowcode/config.yaml
-/docs/
+.crowcode/settings.local.yaml

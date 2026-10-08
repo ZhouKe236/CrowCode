@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from crowcode.tool import DEFAULT_TIMEOUT, Result, _parse_args, _truncate
+from .base import DEFAULT_TIMEOUT, Result, _parse_args, _truncate
 
 _MAX_LINES = 10000
 _MAX_CHARS = 30000

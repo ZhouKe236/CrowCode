@@ -1,14 +1,17 @@
-"""入口：加载配置、构造权限引擎、启动 TUI。"""
+"""入口：加载配置、连接 MCP、构造权限引擎、启动 TUI。"""
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
-from crowcode.config import ConfigError, load
-from crowcode.permission import new_engine
+from crowcode import __version__
+from crowcode import mcp as mcp_client
+from crowcode.config import ConfigError, load_with_fallback
+from crowcode.permission import new_checker
 from crowcode.tool import new_default_registry
-from crowcode.tui import run
+from crowcode.tui import CrowCodeApp
 
 
 def _force_utf8() -> None:
@@ -26,15 +29,41 @@ def _force_utf8() -> None:
             pass
 
 
-def main() -> None:
-    _force_utf8()
+async def _amain() -> int:
+    """异步主流程：MCP 连接与关闭必须发生在同一个事件循环里。"""
     try:
-        cfg = load(".crowcode/config.yaml")
+        cfg = load_with_fallback()
     except ConfigError as e:
         print(e, file=sys.stderr)
-        sys.exit(1)
+        return 1
+
     root = str(Path.cwd().resolve())
-    engine, err = new_engine(root)
-    if err is not None:
-        print("Warning: permission engine degraded:", err, file=sys.stderr)
-    run(cfg.providers, new_default_registry(), engine)
+    registry = new_default_registry()
+    mcp_cfg = mcp_client.load_config(root)
+    manager = await mcp_client.new_manager(mcp_cfg, version=__version__)
+    try:
+        mcp_tools = manager.tools()
+        for tool in mcp_tools:
+            registry.register(tool)
+        checker, err = new_checker(root)
+        if err is not None:
+            print("Warning: permission engine degraded:", err, file=sys.stderr)
+        checker = mcp_client.install_permission(
+            checker, root, [tool.name() for tool in mcp_tools]
+        )
+        app = CrowCodeApp(
+            cfg.providers,
+            registry,
+            checker,
+            mcp_server_count=manager.server_count,
+            mcp_tool_count=len(mcp_tools),
+        )
+        await app.run_async()
+    finally:
+        await manager.close()
+    return 0
+
+
+def main() -> None:
+    _force_utf8()
+    raise SystemExit(asyncio.run(_amain()))

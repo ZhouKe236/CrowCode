@@ -8,7 +8,7 @@ from rich.padding import Padding
 from rich.text import Text
 
 from crowcode.agent import ApprovalRequest
-from crowcode.permission import Mode
+from crowcode.permission import PermissionMode
 from crowcode.prompt import CROW_BANNER
 
 
@@ -20,24 +20,24 @@ def _fmt_tokens(n: int) -> str:
 
 
 _MODE_LABELS = {
-    Mode.DEFAULT: "DEFAULT",
-    Mode.ACCEPT_EDITS: "ACCEPT EDITS",
-    Mode.PLAN: "PLAN",
-    Mode.BYPASS: "BYPASS",
+    PermissionMode.DEFAULT: "DEFAULT",
+    PermissionMode.ACCEPT_EDITS: "ACCEPT EDITS",
+    PermissionMode.PLAN: "PLAN",
+    PermissionMode.BYPASS: "BYPASS",
 }
 
 _MODE_STYLES = {
-    Mode.DEFAULT: "green",
-    Mode.ACCEPT_EDITS: "cyan",
-    Mode.PLAN: "yellow",
-    Mode.BYPASS: "red",
+    PermissionMode.DEFAULT: "green",
+    PermissionMode.ACCEPT_EDITS: "cyan",
+    PermissionMode.PLAN: "yellow",
+    PermissionMode.BYPASS: "red",
 }
 
 
-def mode_status(mode: Mode) -> Text:
+def mode_status(mode: PermissionMode) -> Text:
     """状态栏左下角常驻的权限模式标签；非默认档追加 shift+tab 切换提示。"""
     out = Text(f"[{_MODE_LABELS[mode]}]", style=_MODE_STYLES[mode])
-    if mode is not Mode.DEFAULT:
+    if mode is not PermissionMode.DEFAULT:
         out.append("  (shift+tab to cycle)", style="dim")
     return out
 
@@ -99,6 +99,13 @@ def error_block(err: Exception) -> Text:
 def system_block(text: str) -> Text:
     """系统提示块：灰色斜体，用于 /plan /do 提示、模式切换与停止通知。"""
     return Text("— " + text, style="dim italic")
+
+
+def mcp_summary_block(server_count: int, tool_count: int) -> Text:
+    """MCP 初始化汇总：灰色斜体系统提示。"""
+    return system_block(
+        f"Connected to {server_count} MCP server(s), {tool_count} tools registered"
+    )
 
 
 def _clip_lines(text: str, max_lines: int) -> str:

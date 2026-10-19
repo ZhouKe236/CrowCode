@@ -42,6 +42,30 @@ def load(path: str) -> Config:
     return _from_dict(raw, path)
 
 
+def user_config_path() -> Path:
+    """用户级 provider 配置路径（与 MCP 共用的全局文件）。"""
+    try:
+        return Path.home() / ".crowcode" / "config.yaml"
+    except (OSError, RuntimeError) as e:
+        raise ConfigError(f"无法定位用户目录: {e}") from e
+
+
+def load_with_fallback(project_path: str = ".crowcode/config.yaml") -> Config:
+    """项目级优先：存在则用项目级；不存在才回退用户级。
+
+    项目级文件存在但内容非法时直接抛错，不静默回退。
+    """
+    project = Path(project_path)
+    if project.exists():
+        return load(str(project))
+    user = user_config_path()
+    if not user.exists():
+        raise ConfigError(
+            f"配置文件不存在：项目级 {project_path} 与用户级 {user} 均不存在"
+        )
+    return load(str(user))
+
+
 def _from_dict(raw: object, path: str) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError(f"配置文件 {path} 顶层应为 mapping（含 providers 列表）")

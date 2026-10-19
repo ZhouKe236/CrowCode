@@ -1,14 +1,31 @@
 """config 模块单测。"""
 
+from pathlib import Path
+
 import pytest
 
-from crowcode.config import ConfigError, load
+from crowcode.config import ConfigError, load, load_with_fallback
 
 
 def _write(tmp_path, text: str) -> str:
     p = tmp_path / "config.yaml"
     p.write_text(text, encoding="utf-8")
     return str(p)
+
+
+def _write_at(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """隔离真实用户目录，并返回临时 HOME。"""
+    h = tmp_path / "home"
+    h.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: h))
+    return h
 
 
 def test_valid_single_provider(tmp_path):
@@ -107,3 +124,106 @@ def test_invalid_yaml(tmp_path):
     path = _write(tmp_path, "providers: [unclosed\n")
     with pytest.raises(ConfigError, match="解析失败"):
         load(path)
+
+
+# ── 项目级优先、缺失时回退用户级 ────────────────────────────────
+
+
+def test_provider_falls_back_to_user_config(home, tmp_path):
+    """项目级缺失时读取用户级 provider 配置。"""
+    user = home / ".crowcode" / "config.yaml"
+    _write_at(
+        user,
+        """
+providers:
+  - {name: global, protocol: openai, api_key: gk, model: global-model}
+""",
+    )
+    project = tmp_path / "project" / ".crowcode" / "config.yaml"
+    cfg = load_with_fallback(str(project))
+    assert len(cfg.providers) == 1
+    assert cfg.providers[0].model == "global-model"
+
+
+def test_project_provider_wins_over_user_config(home, tmp_path):
+    """两层都存在时项目级胜出。"""
+    _write_at(
+        home / ".crowcode" / "config.yaml",
+        """
+providers:
+  - {name: global, protocol: openai, api_key: gk, model: global-model}
+""",
+    )
+    project = _write_at(
+        tmp_path / "project" / ".crowcode" / "config.yaml",
+        """
+providers:
+  - {name: local, protocol: openai, api_key: lk, model: local-model}
+""",
+    )
+    cfg = load_with_fallback(str(project))
+    assert len(cfg.providers) == 1
+    assert cfg.providers[0].model == "local-model"
+
+
+def test_provider_both_missing_raises(home, tmp_path):
+    """两层都缺失时报错，并列出两条路径。"""
+    project = tmp_path / "project" / ".crowcode" / "config.yaml"
+    with pytest.raises(ConfigError) as excinfo:
+        load_with_fallback(str(project))
+    message = str(excinfo.value)
+    assert str(project) in message
+    assert str(home / ".crowcode" / "config.yaml") in message
+
+
+def test_invalid_project_does_not_fall_back(home, tmp_path):
+    """项目级存在但非法时直接报错，不回退用户级。"""
+    _write_at(
+        home / ".crowcode" / "config.yaml",
+        """
+providers:
+  - {name: global, protocol: openai, api_key: gk, model: global-model}
+""",
+    )
+    project = _write_at(
+        tmp_path / "project" / ".crowcode" / "config.yaml",
+        "providers: [unclosed\n",
+    )
+    with pytest.raises(ConfigError, match="解析失败"):
+        load_with_fallback(str(project))
+
+
+def test_empty_project_providers_does_not_fall_back(home, tmp_path):
+    """项目级存在但 providers 为空时报错，不回退用户级。"""
+    _write_at(
+        home / ".crowcode" / "config.yaml",
+        """
+providers:
+  - {name: global, protocol: openai, api_key: gk, model: global-model}
+""",
+    )
+    project = _write_at(
+        tmp_path / "project" / ".crowcode" / "config.yaml",
+        "providers: []\n",
+    )
+    with pytest.raises(ConfigError, match="不能为空"):
+        load_with_fallback(str(project))
+
+
+def test_user_config_can_contain_mcp_servers(home, tmp_path):
+    """全局文件同时含 providers 与 mcp_servers 时，provider 加载器忽略后者。"""
+    _write_at(
+        home / ".crowcode" / "config.yaml",
+        """
+providers:
+  - {name: global, protocol: openai, api_key: gk, model: global-model}
+mcp_servers:
+  context7:
+    type: stdio
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+""",
+    )
+    cfg = load_with_fallback(str(tmp_path / "project" / ".crowcode" / "config.yaml"))
+    assert len(cfg.providers) == 1
+    assert cfg.providers[0].model == "global-model"

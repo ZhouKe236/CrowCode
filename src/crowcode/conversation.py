@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from crowcode.llm import (
     ROLE_ASSISTANT,
-    ROLE_USER,
     ROLE_TOOL,
+    ROLE_USER,
     Message,
     ToolCall,
     ToolResult,

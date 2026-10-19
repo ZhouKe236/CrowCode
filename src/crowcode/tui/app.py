@@ -23,7 +23,7 @@ from crowcode.agent import Agent, ApprovalRequest, Phase
 from crowcode.config import ProviderConfig
 from crowcode.conversation import Conversation
 from crowcode.llm import Provider, new_provider
-from crowcode.permission import Engine, Mode, Outcome
+from crowcode.permission import Outcome, PermissionChecker, PermissionMode
 from crowcode.prompt import EXECUTE_DIRECTIVE
 from crowcode.tool import Registry
 
@@ -32,6 +32,7 @@ from .view import (
     approval_block,
     assistant_markdown,
     error_block,
+    mcp_summary_block,
     mode_status,
     model_status,
     render_header,
@@ -53,9 +54,17 @@ class SessionState(Enum):
 _APPROVAL_OUTCOMES = (Outcome.ALLOW_ONCE, Outcome.ALLOW_FOREVER, Outcome.DENY_ONCE)
 
 
-def next_mode(m: Mode) -> Mode:
+_MODE_ORDER = (
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPT_EDITS,
+    PermissionMode.PLAN,
+    PermissionMode.BYPASS,
+)
+
+
+def next_mode(m: PermissionMode) -> PermissionMode:
     """Shift+Tab 循环：DEFAULT → ACCEPT_EDITS → PLAN → BYPASS → DEFAULT。"""
-    return Mode((int(m) + 1) % 4)
+    return _MODE_ORDER[(_MODE_ORDER.index(m) + 1) % len(_MODE_ORDER)]
 
 
 @dataclass
@@ -75,6 +84,11 @@ class ChatInput(TextArea):
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
+            # 仅空闲态把 Enter 当作「提交」；人在回路等非空闲态不拦截，
+            # 让事件冒泡到 App.on_key 处理（三选一等）。
+            app = self.app
+            if isinstance(app, CrowCodeApp) and app.state is not SessionState.IDLE:
+                return
             event.stop()
             event.prevent_default()
             await self._submit()
@@ -119,19 +133,25 @@ class CrowCodeApp(App):
         self,
         providers: list[ProviderConfig],
         registry: Registry,
-        engine: Engine,
+        checker: PermissionChecker,
+        *,
+        mcp_server_count: int = 0,
+        mcp_tool_count: int = 0,
     ) -> None:
         super().__init__()
         self.providers = providers
         # 命名 _tool_registry 而非 _registry：后者是 Textual App 内部 DOM 注册表，冲突。
         self._tool_registry = registry
-        self.engine = engine
+        self.checker = checker
+        # MCP 初始化汇总（0 表示没有成功连接，不展示）。
+        self.mcp_server_count = mcp_server_count
+        self.mcp_tool_count = mcp_tool_count
         self.provider: Provider | None = None
         self.conv = Conversation()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
-        self.mode: Mode = engine.start_mode
+        self.mode: PermissionMode = checker.start_mode
         self.iter: int = 0
         self.usage_in: int = 0
         self.usage_out: int = 0
@@ -164,6 +184,12 @@ class CrowCodeApp(App):
     def on_mount(self) -> None:
         self._input = self.query_one("#input", ChatInput)
         self._input.submit_callback = self.submit
+        # 写在状态分支之前：SELECTING 时日志被隐藏，写入会排队，选中 provider
+        # 后随 resize 一起显示；只写 else 分支会让多 provider 用户永远看不到。
+        if self.mcp_server_count > 0:
+            log = self.query_one("#log", RichLog)
+            log.write("")  # 先空一行
+            log.write(mcp_summary_block(self.mcp_server_count, self.mcp_tool_count))
         if self.state is SessionState.SELECTING:
             self._set_selecting(True)
             self.query_one("#options", OptionList).focus()
@@ -198,13 +224,15 @@ class CrowCodeApp(App):
         log = self.query_one("#log", RichLog)
 
         if text == "/plan":
-            self.mode = Mode.PLAN
+            self.mode = PermissionMode.PLAN
             log.write(system_block("Entered plan mode (read-only tools)."))
             self._update_mode_label()
             return
         if text == "/do":
-            self.mode = Mode.DEFAULT
-            log.write(system_block("Switched back to default mode, executing the plan."))
+            self.mode = PermissionMode.DEFAULT
+            log.write(
+                system_block("Switched back to default mode, executing the plan.")
+            )
             self.conv.add_user(EXECUTE_DIRECTIVE)
             self._update_mode_label()
         else:
@@ -214,6 +242,7 @@ class CrowCodeApp(App):
         assert self.provider is not None
         assert self._input is not None
         self._input.clear()
+        self._input.blur()  # 提交后立即失焦，避免流式/待批准态下输入框吞掉按键
         self.cur_reply = ""
         self.cur_tools = []
         self.iter = 0
@@ -227,7 +256,7 @@ class CrowCodeApp(App):
     async def _consume_agent_events(self) -> None:
         assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(self.provider, self._tool_registry, __version__, self.engine)
+        agent = Agent(self.provider, self._tool_registry, __version__, self.checker)
         log = self.query_one("#log", RichLog)
         try:
             async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
@@ -237,8 +266,7 @@ class CrowCodeApp(App):
                     self.approve_cursor = 0
                     self.state = SessionState.APPROVING
                     self._refresh_approval()
-                    if self._input is not None:
-                        self._input.blur()
+                    self.screen.set_focus(None)  # 待批准态强制失焦，按键直达 App.on_key
                     continue
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
@@ -359,7 +387,9 @@ class CrowCodeApp(App):
     def _render_header(self) -> None:
         model = self.provider.model if self.provider is not None else None
         self.query_one("#header", Static).update(
-            render_header(__version__, os.getcwd(), model, self.usage_in, self.usage_out)
+            render_header(
+                __version__, os.getcwd(), model, self.usage_in, self.usage_out
+            )
         )
 
     def _update_mode_label(self) -> None:
@@ -426,7 +456,16 @@ class CrowCodeApp(App):
 def run(
     providers: list[ProviderConfig],
     registry: Registry,
-    engine: Engine,
+    checker: PermissionChecker,
+    *,
+    mcp_server_count: int = 0,
+    mcp_tool_count: int = 0,
 ) -> None:
     """启动 CrowCode TUI。"""
-    CrowCodeApp(providers, registry, engine).run()
+    CrowCodeApp(
+        providers,
+        registry,
+        checker,
+        mcp_server_count=mcp_server_count,
+        mcp_tool_count=mcp_tool_count,
+    ).run()

@@ -275,3 +275,194 @@ async def test_mcp_summary_visible_after_provider_selection(tmp_path):
             "",
             "— Connected to 1 MCP server(s), 2 tools registered",
         ]
+
+
+# ── 命令分发与上下文压缩 UI ────────────────────────────────────────
+
+
+from crowcode.agent import CompactEvent, CompactPhase, Event
+from crowcode.tui.commands import (
+    BUILTIN_COMMANDS,
+    dispatch_command,
+    format_compact_notice,
+)
+
+
+class MockAgent:
+    """记录调用的假 Agent，用于命令路径测试。"""
+
+    def __init__(self, events=None, force_result=(120000, 42000), force_error=None):
+        self.events = events or []
+        self.force_result = force_result
+        self.force_error = force_error
+        self.run_calls = 0
+        self.force_calls = 0
+        self.received_defs = []
+
+    async def run(self, conv, mode, cancel):
+        self.run_calls += 1
+        for event in self.events:
+            yield event
+
+    async def run_force_compact(self, conv, defs):
+        self.force_calls += 1
+        self.received_defs.append(defs)
+        if self.force_error is not None:
+            raise self.force_error
+        return self.force_result
+
+
+def _log_texts(app) -> list[str]:
+    return [strip.text for strip in app.query_one("#log", RichLog).lines]
+
+
+def test_dispatch_registry_has_four_commands():
+    assert set(BUILTIN_COMMANDS) == {"/exit", "/plan", "/do", "/compact"}
+    for name, handler in BUILTIN_COMMANDS.items():
+        assert dispatch_command(name) == (handler, True)
+
+
+def test_dispatch_unknown_and_plain_text():
+    handler, ok = dispatch_command("/unknown")
+    assert ok is True and handler is not None
+    assert dispatch_command("hello") == (None, False)
+
+
+def test_format_compact_notice():
+    assert (
+        format_compact_notice(CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+        == "正在压缩上下文..."
+    )
+    assert (
+        format_compact_notice(CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY))
+        == "上下文撞墙，自动压缩中..."
+    )
+    assert (
+        format_compact_notice(
+            CompactEvent(phase=CompactPhase.AFTER_AUTO, before=100, after=10)
+        )
+        == "已压缩，token 从 100 降至 10"
+    )
+    assert (
+        format_compact_notice(
+            CompactEvent(phase=CompactPhase.AFTER_AUTO, err=RuntimeError("boom"))
+        )
+        == "压缩失败：boom"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_compact_routes_to_command(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    async with app.run_test() as pilot:
+        agent = MockAgent()
+        app.agent = agent
+        await app.submit("/compact")
+        await pilot.pause()
+
+        assert agent.force_calls == 1
+        assert agent.run_calls == 0
+        assert app.conv.length() == 0  # 命令不写入对话历史
+        texts = _log_texts(app)
+        assert "— 已压缩，token 从 120000 降至 42000" in texts
+
+
+@pytest.mark.asyncio
+async def test_tui_unknown_slash_command_friendly(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    async with app.run_test() as pilot:
+        agent = MockAgent()
+        app.agent = agent
+        await app.submit("/unknown")
+        await pilot.pause()
+
+        assert agent.run_calls == 0
+        assert agent.force_calls == 0
+        assert any("未知命令: /unknown" in text for text in _log_texts(app))
+
+
+@pytest.mark.asyncio
+async def test_tui_compact_failure_shown(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    async with app.run_test() as pilot:
+        app.agent = MockAgent(force_error=RuntimeError("bad"))
+        await app.submit("/compact")
+        await pilot.pause()
+        assert any("压缩失败：bad" in text for text in _log_texts(app))
+
+
+@pytest.mark.asyncio
+async def test_tui_migrated_plan_still_works(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    async with app.run_test() as pilot:
+        agent = MockAgent()
+        app.agent = agent
+        await app.submit("/plan")
+        await pilot.pause()
+        assert app.mode is PermissionMode.PLAN
+        assert agent.run_calls == 0
+        assert any("Entered plan mode" in text for text in _log_texts(app))
+
+
+@pytest.mark.asyncio
+async def test_tui_migrated_do_still_works(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    async with app.run_test() as pilot:
+        agent = MockAgent(events=[Event(done=True)])
+        app.agent = agent
+        await app.submit("/do")
+        await pilot.pause()
+        assert app.mode is PermissionMode.DEFAULT
+        assert agent.run_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tui_renders_compact_events(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    async with app.run_test() as pilot:
+        app.agent = MockAgent(
+            events=[
+                Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO)),
+                Event(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_AUTO, before=167000, after=12000
+                    )
+                ),
+                Event(done=True),
+            ]
+        )
+        await app.submit("hello")
+        await pilot.pause()
+
+        texts = _log_texts(app)
+        assert "— 正在压缩上下文..." in texts
+        assert "— 已压缩，token 从 167000 降至 12000" in texts
+        # 压缩提示不写入对话历史。
+        assert all("压缩" not in m.content for m in app.conv.messages())
+
+
+@pytest.mark.asyncio
+async def test_handle_exit_calls_quit():
+    from crowcode.tui.commands import handle_exit
+
+    class Stub:
+        exited = False
+
+        async def action_quit(self):
+            self.exited = True
+
+    stub = Stub()
+    await handle_exit(stub)  # type: ignore[arg-type]
+    assert stub.exited is True
+
+
+def test_app_runtime_context_window_from_provider(tmp_path):
+    checker, _ = new_checker(str(tmp_path))
+    app = CrowCodeApp(_cfg(), new_default_registry(), checker)
+    assert app.runtime.context_window == 128000  # openai 默认

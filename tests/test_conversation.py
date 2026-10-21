@@ -1,7 +1,7 @@
 """conversation 模块单测。"""
 
 from crowcode.conversation import Conversation
-from crowcode.llm import ToolCall, ToolResult
+from crowcode.llm import Message, ToolCall, ToolResult
 
 
 def test_sequence_and_roles():
@@ -39,6 +39,25 @@ def test_tool_turn_sequence():
     assert msgs[1].tool_calls[0].input == '{"path": "a.txt"}'
     assert msgs[2].tool_results[0].tool_call_id == "c1"
     assert msgs[2].tool_results[0].content == "内容"
+
+
+def test_replace_history_deep_copy():
+    conv = Conversation()
+    conv.add_user("old")
+    msgs = [Message(role="user", content="new")]
+    conv.replace_history(msgs)
+    msgs[0].content = "changed"
+    assert conv.messages()[0].content == "new"
+    assert conv.length() == 1
+
+
+def test_replace_history_empty():
+    conv = Conversation()
+    conv.add_user("old")
+    conv.replace_history(None)
+    assert conv.messages() == []
+    conv.replace_history([])
+    assert conv.length() == 0
 
 
 def test_last_role():

@@ -8,6 +8,11 @@ from typing import Any, Literal, Protocol
 
 from crowcode.config import ProviderConfig
 
+
+class PromptTooLongError(Exception):
+    """Provider 上报上下文超出窗口时统一抛出的哨兵异常。"""
+
+
 Role = Literal["user", "assistant", "tool"]
 
 # 消息角色。

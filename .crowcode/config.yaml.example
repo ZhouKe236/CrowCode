@@ -2,6 +2,8 @@
 # 复制本文件为 config.yaml 并填入你的真实密钥：
 #   cp .crowcode/config.yaml.example .crowcode/config.yaml
 # config.yaml 已被 .gitignore 忽略，请勿提交真实密钥。
+# context_window 单位为 token，可选；未配置时按 protocol 默认
+# （anthropic 200000、openai 128000）。
 
 providers:
 
@@ -11,6 +13,7 @@ providers:
 #    api_key: sk-ant-xxxx         # 你的 API 密钥（必填）
 #    model: claude-sonnet-5       # 模型名
 #    thinking: true               # 可选：开启扩展思考（仅 anthropic 生效）
+#    context_window: 200000       # 可选：上下文窗口 token 数
 
   # OpenAI 协议示例（取消注释并填密钥即可启用；多个 provider 时启动会弹出选择列表）
 #   - protocol: openai
@@ -18,3 +21,4 @@ providers:
 #     api_key: sk-xxxx
 #     model: gpt-4o
 #     base_url: https://api.openai.com/v1   # 可选：自定义端点（兼容服务），省略则用官方默认
+#     context_window: 128000                # 可选：上下文窗口 token 数

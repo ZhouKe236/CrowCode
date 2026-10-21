@@ -3,17 +3,39 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
+from crowcode.compact import ManageInput, TriggerKind, manage_context
+from crowcode.compact.const import (
+    AUTO_SAFETY_MARGIN,
+    MANUAL_SAFETY_MARGIN,
+    SUMMARY_RESERVE,
+)
+from crowcode.compact.token import estimate_tokens
+from crowcode.compact.token import usage_anchor as usage_to_anchor
 from crowcode.conversation import Conversation
-from crowcode.llm import Provider, Request, System, ToolCall, ToolDefinition, ToolResult
+from crowcode.llm import (
+    PromptTooLongError,
+    Provider,
+    Request,
+    System,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
 from crowcode.llm import Usage as LLMUsage
 from crowcode.permission import Outcome, PermissionChecker, PermissionMode
 from crowcode.prompt import build_system_prompt, gather_environment, plan_reminder
 from crowcode.tool import DEFAULT_TIMEOUT, Registry, Result
+
+from .event import CompactEvent, CompactPhase
+from .runtime import SessionRuntime, new_session_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +108,7 @@ class Event:
     done: bool = False  # 本轮（整个 Loop）结束
     err: Exception | None = None  # 出错（不中断会话）
     approval: ApprovalRequest | None = None  # 人在回路待批准请求（非 None 即暂停 Loop）
+    compact: CompactEvent | None = None  # 压缩生命周期事件
 
 
 class Agent:
@@ -97,11 +120,23 @@ class Agent:
         registry: Registry,
         version: str,
         checker: PermissionChecker,
+        *,
+        runtime: SessionRuntime | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
         self._checker = checker
+        # 未注入 runtime 时是测试 / 嵌入式用法，落盘目录放系统临时目录，
+        # 避免在项目根目录堆出大量会话子目录。
+        self._runtime = runtime or new_session_runtime(workspace=tempfile.gettempdir())
+        # 保证 run 与 run_force_compact 不并发。
+        self._run_lock = asyncio.Lock()
+
+    @property
+    def runtime(self) -> SessionRuntime:
+        """跨 run 持有的会话状态。"""
+        return self._runtime
 
     async def run(
         self,
@@ -114,12 +149,27 @@ class Agent:
         ``mode`` 决定工具集；``cancel`` 为 per-turn 取消事件，调用方触发
         ``cancel.set()`` 即中断本轮（不退出程序）。
         """
+        async with self._run_lock:
+            async for event in self._run_locked(conv, mode, cancel):
+                yield event
+
+    async def run_force_compact(
+        self, conv: Conversation, tool_defs: list[ToolDefinition]
+    ) -> tuple[int, int]:
+        """手动 ``/compact`` 入口：等待主循环空闲后无条件摘要一次。"""
+        async with self._run_lock:
+            in_ = self._manage_input(conv, tool_defs, TriggerKind.MANUAL)
+            out = await manage_context(in_)
+            return out.before_tokens, out.after_tokens
+
+    async def _run_locked(
+        self,
+        conv: Conversation,
+        mode: PermissionMode,
+        cancel: asyncio.Event,
+    ) -> AsyncIterator[Event]:
         env_text = gather_environment(self._version, self._provider.model).render()
         sys_prompt = build_system_prompt()
-        if mode is PermissionMode.PLAN:
-            defs = self._registry.read_only_definitions()
-        else:
-            defs = self._registry.definitions()
 
         unknown_run = 0
         for it in range(1, MAX_ITERATIONS + 1):
@@ -128,26 +178,131 @@ class Agent:
                 self._finish_cancelled(conv)
                 return
 
+            if mode is PermissionMode.PLAN:
+                defs = self._registry.read_only_definitions()
+            else:
+                defs = self._registry.definitions()
+
             reminder = ""
             if mode is PermissionMode.PLAN:
                 full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
                 reminder = plan_reminder(full)
 
-            holder: list[tuple[str, list[ToolCall], LLMUsage | None, bool]] = []
+            # 本轮请求前的上下文管理：第 1 层始终执行，必要时触发第 2 层。
+            in_ = self._manage_input(conv, defs, TriggerKind.AUTO)
+            will_summarize = (
+                self._runtime.context_window > SUMMARY_RESERVE + AUTO_SAFETY_MARGIN
+                and in_.estimated_token >= self._auto_threshold()
+            )
+            if will_summarize:
+                yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+
+            manage_out = None
+            manage_err: Exception | None = None
+            try:
+                manage_out = await manage_context(in_)
+            except Exception as e:  # noqa: BLE001 —— 压缩失败转成事件
+                manage_err = e
+
+            if will_summarize:
+                yield Event(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_AUTO,
+                        before=(
+                            manage_out.before_tokens
+                            if manage_out is not None
+                            else in_.estimated_token
+                        ),
+                        after=(
+                            manage_out.after_tokens if manage_out is not None else 0
+                        ),
+                        err=manage_err,
+                    )
+                )
+            if manage_err is not None:
+                yield Event(err=manage_err)
+                self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                return
+            if cancel.is_set():
+                self._finish_cancelled(conv)
+                return
+
+            emergency_retried = False
+            holder: list[
+                tuple[str, list[ToolCall], LLMUsage | None, Exception | None]
+            ] = []
             async for ev in self._stream_once(
                 conv, sys_prompt, env_text, defs, reminder, cancel, holder
             ):
                 yield ev
-            text, calls, usage, ok = holder[0]
-            if not ok:
+            text, calls, usage, err = holder[0]
+
+            if (
+                err is not None
+                and isinstance(err, PromptTooLongError)
+                and not emergency_retried
+            ):
+                yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY))
+                emergency_in = self._manage_input(conv, defs, TriggerKind.EMERGENCY)
+                emergency_out = None
+                emergency_err: Exception | None = None
+                try:
+                    emergency_out = await manage_context(emergency_in)
+                except Exception as e:  # noqa: BLE001 —— 转成事件
+                    emergency_err = e
+                yield Event(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_EMERGENCY,
+                        before=(
+                            emergency_out.before_tokens
+                            if emergency_out is not None
+                            else emergency_in.estimated_token
+                        ),
+                        after=(
+                            emergency_out.after_tokens
+                            if emergency_out is not None
+                            else 0
+                        ),
+                        err=emergency_err,
+                    )
+                )
+                if emergency_err is not None:
+                    yield Event(err=emergency_err)
+                    self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                    return
+
+                # 对话已重建，重置锚点并用新消息重新估算。
+                self._runtime.usage_anchor = 0
+                self._runtime.anchor_msg_len = 0
+                est2 = estimate_tokens(0, conv.messages(), 0)
+                if est2 >= self._runtime.context_window - MANUAL_SAFETY_MARGIN:
+                    yield Event(err=err)
+                    self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                    return
+
+                emergency_retried = True
+                holder = []
+                async for ev in self._stream_once(
+                    conv, sys_prompt, env_text, defs, reminder, cancel, holder
+                ):
+                    yield ev
+                text, calls, usage, err = holder[0]
+
+            if err is not None:
                 if cancel.is_set():
                     self._finish_cancelled(conv)
                     return
-                # 流出错：err 事件已在 stream_once 内 yield。
+                yield Event(err=err)
                 self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                return
+            if cancel.is_set():
+                self._finish_cancelled(conv)
                 return
 
             if usage is not None:
+                # 锚点用最近一次主对话路径真实 usage 替换，不累加。
+                self._runtime.usage_anchor = usage_to_anchor(usage)
+                self._runtime.anchor_msg_len = conv.length()
                 yield Event(
                     usage=Usage(
                         input=usage.input_tokens,
@@ -192,6 +347,35 @@ class Agent:
         self._ensure_assistant_tail(conv, NOTICE_MAX_ITER)
         yield Event(done=True)
 
+    def _auto_threshold(self) -> int:
+        """自动摘要触发阈值。"""
+        return self._runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
+
+    def _manage_input(
+        self,
+        conv: Conversation,
+        tool_defs: list[ToolDefinition],
+        trigger: TriggerKind,
+    ) -> ManageInput:
+        """用当前会话状态构造一次上下文管理入参。"""
+        msgs = conv.messages()
+        anchor = self._runtime.usage_anchor
+        anchor_len = self._runtime.anchor_msg_len
+        return ManageInput(
+            conv=conv,
+            provider=self._provider,
+            context_window=self._runtime.context_window,
+            tool_defs=tool_defs,
+            replacement=self._runtime.replacement,
+            recovery=self._runtime.recovery,
+            auto_tracking=self._runtime.auto_tracking,
+            session=self._runtime.session,
+            usage_anchor=anchor,
+            anchor_msg_len=anchor_len,
+            estimated_token=estimate_tokens(anchor, msgs, anchor_len),
+            trigger=trigger,
+        )
+
     async def _stream_once(
         self,
         conv: Conversation,
@@ -204,9 +388,9 @@ class Agent:
     ):
         """单轮请求：转发文本增量、收集工具调用与用量。
 
-        以 async generator 形式把文本 / 出错事件 yield 出去；结束时把
-        ``(text, calls, usage, ok)`` 写入 ``holder``（Python 异步生成器不能 ``return value``，
-        用可变容器回传结果）。
+        以 async generator 形式把文本事件 yield 出去；结束时把
+        ``(text, calls, usage, err)`` 写入 ``holder``。errors 不在这里 yield，
+        由主循环统一处理，保证出错时累加的文本不写回 Conversation。
         """
         text_parts: list[str] = []
         calls: list[ToolCall] = []
@@ -220,11 +404,10 @@ class Agent:
         try:
             async for se in self._provider.stream(req):
                 if cancel.is_set():
-                    holder.append(("", [], None, False))
+                    holder.append(("", [], None, None))
                     return
                 if se.err is not None:
-                    yield Event(err=se.err)
-                    holder.append(("", [], None, False))
+                    holder.append(("", [], None, se.err))
                     return
                 if se.usage is not None:
                     usage = se.usage
@@ -235,14 +418,13 @@ class Agent:
                     yield Event(text=se.text)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001 —— 转成 err 事件，不中断会话
-            yield Event(err=e)
-            holder.append(("", [], None, False))
+        except Exception as e:  # noqa: BLE001 —— 转成 err，不中断会话
+            holder.append(("", [], None, e))
             return
         if cancel.is_set():
-            holder.append(("", [], None, False))
+            holder.append(("", [], None, None))
             return
-        holder.append(("".join(text_parts), calls, usage, True))
+        holder.append(("".join(text_parts), calls, usage, None))
 
     async def _execute_batched(
         self,
@@ -382,6 +564,32 @@ class Agent:
             )
         results[idx] = ToolResult(
             tool_call_id=call.id, content=r.content, is_error=r.is_error
+        )
+        if not r.is_error and call.name == "read_file":
+            # 同一 task 内顺序完成，保证下一次 manage_context 能看到记录。
+            await self._record_read_file(call)
+
+    async def _record_read_file(self, call: ToolCall) -> None:
+        """用纯净字节（不带行号前缀）记录一次成功的文件读取。"""
+        try:
+            args = json.loads(call.input or "{}")
+        except json.JSONDecodeError:
+            return
+        if not isinstance(args, dict):
+            return
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            abs_path = str(Path(path).resolve())
+        except (OSError, RuntimeError):
+            return
+        try:
+            data = await asyncio.to_thread(Path(abs_path).read_bytes)
+        except OSError:
+            return
+        self._runtime.recovery.record_file(
+            abs_path, data.decode("utf-8", errors="replace")
         )
 
     def _finalize(

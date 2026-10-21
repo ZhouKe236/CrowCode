@@ -8,7 +8,12 @@ from pathlib import Path
 
 from crowcode import __version__
 from crowcode import mcp as mcp_client
-from crowcode.config import ConfigError, load_with_fallback
+from crowcode.agent.runtime import new_session_runtime
+from crowcode.config import (
+    ConfigError,
+    effective_context_window,
+    load_with_fallback,
+)
 from crowcode.permission import new_checker
 from crowcode.tool import new_default_registry
 from crowcode.tui import CrowCodeApp
@@ -38,6 +43,10 @@ async def _amain() -> int:
         return 1
 
     root = str(Path.cwd().resolve())
+    runtime = new_session_runtime(
+        workspace=root,
+        context_window=effective_context_window(cfg.providers[0]),
+    )
     registry = new_default_registry()
     mcp_cfg = mcp_client.load_config(root)
     manager = await mcp_client.new_manager(mcp_cfg, version=__version__)
@@ -55,6 +64,7 @@ async def _amain() -> int:
             cfg.providers,
             registry,
             checker,
+            runtime=runtime,
             mcp_server_count=manager.server_count,
             mcp_tool_count=len(mcp_tools),
         )

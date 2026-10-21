@@ -3,6 +3,7 @@
 import asyncio
 import json
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -13,10 +14,12 @@ from crowcode.agent import (
     NOTICE_MAX_ITER,
     NOTICE_UNKNOWN_TOOLS,
     Agent,
+    CompactPhase,
     Phase,
+    new_session_runtime,
 )
 from crowcode.conversation import Conversation
-from crowcode.llm import StreamEvent, ToolCall
+from crowcode.llm import PromptTooLongError, StreamEvent, ToolCall
 from crowcode.llm import Usage as LLMUsage
 from crowcode.permission import Outcome, PermissionMode, new_checker
 from crowcode.prompt import plan_reminder
@@ -681,3 +684,466 @@ async def test_permission_cancel_during_approval(tmp_path):
     await drive()
     assert tool.calls == 0
     assert conv.last_role() == "assistant"
+
+
+# ── 上下文管理集成 ────────────────────────────────────────────────
+
+_SUMMARY = (
+    "<summary>## 1 主要请求和意图\n摘要正文\n"
+    "## 6 所有用户消息原文\n用户说：x\n</summary>"
+)
+
+
+def _runtime(tmp_path, context_window: int = 200000):
+    return new_session_runtime(str(tmp_path), context_window=context_window)
+
+
+def _collect(agent, conv, mode=PermissionMode.DEFAULT):
+    async def drive():
+        return [ev async for ev in agent.run(conv, mode, asyncio.Event())]
+
+    return drive()
+
+
+@pytest.mark.asyncio
+async def test_tool_defs_shared_reference(tmp_path, monkeypatch):
+    """同一轮迭代内 ManageInput.tool_defs 与 Request.tools 是同一引用。"""
+    from crowcode.agent import loop as loop_module
+
+    captured = {}
+    real = loop_module.manage_context
+
+    async def spy(in_):
+        captured["defs"] = in_.tool_defs
+        return await real(in_)
+
+    monkeypatch.setattr(loop_module, "manage_context", spy)
+    registry = new_default_registry()
+    provider = FakeProvider([[text("ok"), done()]])
+    conv = Conversation()
+    conv.add_user("x")
+
+    await _collect(
+        Agent(provider, registry, _VERSION, _checker(), runtime=_runtime(tmp_path)),
+        conv,
+    )
+
+    assert captured["defs"] is provider.received_requests[0].tools
+
+
+@pytest.mark.asyncio
+async def test_agent_usage_anchor_replaced_not_accumulated(tmp_path):
+    provider = FakeProvider(
+        [
+            [text("a"), usage_ev(100, 0, 0, 0), done()],
+            [text("b"), usage_ev(100, 30, 10, 10), done()],
+            [text("c"), usage_ev(200, 20, 0, 0), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path)
+    agent = Agent(
+        provider,
+        new_default_registry(),
+        _VERSION,
+        _checker(),
+        runtime=runtime,
+    )
+    conv = Conversation()
+    conv.add_user("x")
+
+    for expected in (100, 150, 220):
+        await _collect(agent, conv)
+        assert runtime.usage_anchor == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_records_read_file_pure_bytes(tmp_path):
+    file = tmp_path / "a.txt"
+    file.write_bytes(b"hello\nworld")
+
+    class FakeReadTool:
+        read_only = True
+
+        def name(self):
+            return "read_file"
+
+        def description(self):
+            return "fake"
+
+        def parameters(self):
+            return {"type": "object", "properties": {"path": {"type": "string"}}}
+
+        async def execute(self, args, timeout=30.0):
+            return Result(content="     1\thello\n     2\tworld", is_error=False)
+
+    registry = Registry()
+    registry.register(FakeReadTool())
+    provider = FakeProvider(
+        [
+            [
+                tc("read_file", input=json.dumps({"path": str(file)})),
+                done(),
+            ],
+            [text("ok"), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path)
+    conv = Conversation()
+    conv.add_user("读文件")
+
+    await _collect(
+        Agent(provider, registry, _VERSION, _checker(tmp_path), runtime=runtime),
+        conv,
+    )
+
+    snapshot = runtime.recovery.snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0].path == str(file.resolve())
+    assert snapshot[0].content == "hello\nworld"
+
+
+@pytest.mark.asyncio
+async def test_agent_emergency_compact_succeeds(tmp_path):
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=PromptTooLongError("ptl"))],
+            [text(_SUMMARY), done()],
+            [text("重试成功"), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path)
+    conv = Conversation()
+    conv.add_user("x")
+
+    events = await _collect(
+        Agent(
+            provider,
+            new_default_registry(),
+            _VERSION,
+            _checker(),
+            runtime=runtime,
+        ),
+        conv,
+    )
+
+    assert provider.call == 3
+    assert any(e.text == "重试成功" for e in events)
+    assert any(e.done for e in events)
+    phases = [e.compact.phase for e in events if e.compact is not None]
+    assert phases == [CompactPhase.BEFORE_EMERGENCY, CompactPhase.AFTER_EMERGENCY]
+    after = next(e.compact for e in events if e.compact and e.compact.after)
+    assert after.err is None
+
+
+@pytest.mark.asyncio
+async def test_agent_emergency_compact_re_raise_on_second_ptl(tmp_path):
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=PromptTooLongError("first"))],
+            [text(_SUMMARY), done()],
+            [StreamEvent(err=PromptTooLongError("second"))],
+        ]
+    )
+    runtime = _runtime(tmp_path)
+    conv = Conversation()
+    conv.add_user("x")
+
+    events = await _collect(
+        Agent(
+            provider,
+            new_default_registry(),
+            _VERSION,
+            _checker(),
+            runtime=runtime,
+        ),
+        conv,
+    )
+
+    assert provider.call == 3  # 不做第三次主对话请求
+    assert any(isinstance(e.err, PromptTooLongError) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_agent_emergency_unrecoverable_when_still_too_big(tmp_path):
+    huge_summary = "<summary>" + "x" * 120000 + "</summary>"
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=PromptTooLongError("ptl"))],
+            [text(huge_summary), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path, context_window=34000)
+    conv = Conversation()
+    conv.add_user("x")
+
+    events = await _collect(
+        Agent(
+            provider,
+            new_default_registry(),
+            _VERSION,
+            _checker(),
+            runtime=runtime,
+        ),
+        conv,
+    )
+
+    assert provider.call == 2  # 摘要后直接上抛，不重试主对话
+    assert any(isinstance(e.err, PromptTooLongError) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_agent_emits_auto_compact_events(tmp_path):
+    provider = FakeProvider(
+        [
+            [text(_SUMMARY), done()],
+            [text("ok"), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path, context_window=40000)
+    conv = Conversation()
+    for _ in range(10):
+        conv.add_user("u" * 10000)
+        conv.add_assistant("a" * 10000)
+
+    events = await _collect(
+        Agent(
+            provider,
+            new_default_registry(),
+            _VERSION,
+            _checker(),
+            runtime=runtime,
+        ),
+        conv,
+    )
+
+    compacts = [e.compact for e in events if e.compact is not None]
+    assert [c.phase for c in compacts] == [
+        CompactPhase.BEFORE_AUTO,
+        CompactPhase.AFTER_AUTO,
+    ]
+    assert compacts[1].err is None
+    assert compacts[1].before > compacts[1].after
+
+
+@pytest.mark.asyncio
+async def test_agent_no_compact_event_below_threshold(tmp_path):
+    provider = FakeProvider([[text("ok"), done()]])
+    conv = Conversation()
+    conv.add_user("x")
+
+    events = await _collect(
+        Agent(
+            provider,
+            new_default_registry(),
+            _VERSION,
+            _checker(),
+            runtime=_runtime(tmp_path),
+        ),
+        conv,
+    )
+    assert [e for e in events if e.compact is not None] == []
+
+
+@pytest.mark.asyncio
+async def test_run_force_compact_waits_and_returns_tokens(tmp_path):
+    provider = FakeProvider([[text(_SUMMARY), done()]])
+    runtime = _runtime(tmp_path)
+    agent = Agent(
+        provider,
+        new_default_registry(),
+        _VERSION,
+        _checker(),
+        runtime=runtime,
+    )
+    conv = Conversation()
+    conv.add_user("hi")
+    defs = new_default_registry().definitions()
+
+    before, after = await agent.run_force_compact(conv, defs)
+    assert isinstance(before, int) and isinstance(after, int)
+    assert conv.messages()[0].content.startswith("## 历史会话摘要")
+
+
+@pytest.mark.asyncio
+async def test_large_tool_result_replaced_before_next_request(tmp_path):
+    class BigTool:
+        read_only = True
+
+        def name(self):
+            return "read_file"
+
+        def description(self):
+            return "big"
+
+        def parameters(self):
+            return {"type": "object", "properties": {"path": {"type": "string"}}}
+
+        async def execute(self, args, timeout=30.0):
+            return Result(content="x" * 80000, is_error=False)
+
+    registry = Registry()
+    registry.register(BigTool())
+    provider = FakeProvider(
+        [
+            [tc("read_file", input='{"path": "missing.txt"}'), done()],
+            [text("完成"), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path)
+    conv = Conversation()
+    conv.add_user("读大文件")
+
+    await _collect(
+        Agent(provider, registry, _VERSION, _checker(tmp_path), runtime=runtime),
+        conv,
+    )
+
+    second_req = provider.received_requests[1]
+    tool_msg = next(m for m in second_req.messages if m.role == "tool")
+    content = tool_msg.tool_results[0].content
+    assert "[content offloaded] original size: 80000 bytes" in content
+    spill = Path(runtime.session.spill_dir) / "1"
+    assert spill.exists()
+    assert spill.stat().st_size == 80000
+
+
+@pytest.mark.asyncio
+async def test_long_session_auto_compacts(tmp_path):
+    """长会话中途自动摘要，对话长度不随工具结果线性增长。"""
+
+    class EndlessProvider:
+        def __init__(self):
+            self.calls = 0
+            self.summary_calls = 0
+
+        @property
+        def name(self):
+            return "loop"
+
+        @property
+        def model(self):
+            return "loop-model"
+
+        async def stream(self, req):
+            self.calls += 1
+            if not req.tools:
+                self.summary_calls += 1
+                yield StreamEvent(text=_SUMMARY)
+                yield done()
+                return
+            yield tc("read_file", input='{"path": "missing.txt"}')
+            yield done()
+
+    class BigTool:
+        read_only = True
+
+        def name(self):
+            return "read_file"
+
+        def description(self):
+            return "big"
+
+        def parameters(self):
+            return {"type": "object", "properties": {"path": {"type": "string"}}}
+
+        async def execute(self, args, timeout=30.0):
+            return Result(content="x" * 30000, is_error=False)
+
+    registry = Registry()
+    registry.register(BigTool())
+    provider = EndlessProvider()
+    runtime = _runtime(tmp_path, context_window=100000)
+    conv = Conversation()
+    conv.add_user("长任务")
+
+    events = await _collect(
+        Agent(provider, registry, _VERSION, _checker(tmp_path), runtime=runtime),
+        conv,
+    )
+
+    assert provider.summary_calls >= 1
+    assert any(e.notice == NOTICE_MAX_ITER for e in events)
+    assert conv.length() < 30
+
+
+@pytest.mark.asyncio
+async def test_summary_usage_does_not_update_anchor(tmp_path):
+    summary_usage = LLMUsage(input_tokens=999999)
+    provider = FakeProvider(
+        [
+            [text(_SUMMARY), StreamEvent(usage=summary_usage), done()],
+            [text("ok"), usage_ev(100, 0, 0, 0), done()],
+        ]
+    )
+    runtime = _runtime(tmp_path, context_window=40000)
+    conv = Conversation()
+    conv.add_user("x" * 30000)
+
+    await _collect(
+        Agent(
+            provider,
+            new_default_registry(),
+            _VERSION,
+            _checker(),
+            runtime=runtime,
+        ),
+        conv,
+    )
+
+    assert runtime.usage_anchor == 100
+
+
+@pytest.mark.asyncio
+async def test_run_force_compact_waits_for_run(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    class SlowProvider:
+        @property
+        def name(self):
+            return "slow"
+
+        @property
+        def model(self):
+            return "slow-model"
+
+        async def stream(self, req):
+            if req.tools:
+                started.set()
+                await release.wait()
+                yield StreamEvent(text="ok")
+            else:
+                yield StreamEvent(text=_SUMMARY)
+            yield done()
+
+    provider = SlowProvider()
+    registry = new_default_registry()
+    agent = Agent(
+        provider,
+        registry,
+        _VERSION,
+        _checker(),
+        runtime=_runtime(tmp_path),
+    )
+    conv = Conversation()
+    conv.add_user("x")
+
+    async def consume():
+        async for _ in agent.run(conv, PermissionMode.DEFAULT, asyncio.Event()):
+            pass
+        order.append("run")
+
+    run_task = asyncio.create_task(consume())
+    await started.wait()
+    compact_task = asyncio.create_task(
+        agent.run_force_compact(conv, registry.definitions())
+    )
+    await asyncio.sleep(0.05)
+    assert compact_task.done() is False  # 等待 run 释放锁
+
+    release.set()
+    await run_task
+    await compact_task
+    assert order == ["run"]
+    assert compact_task.done()

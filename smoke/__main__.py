@@ -10,7 +10,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-from crowcode.agent import Agent, ApprovalRequest
+from crowcode.agent import Agent, ApprovalRequest, new_session_runtime
 from crowcode.conversation import Conversation
 from crowcode.llm import StreamEvent, ToolCall
 from crowcode.permission import PermissionMode, new_checker
@@ -93,8 +93,9 @@ async def _run() -> None:
 
     conv = Conversation()
     conv.add_user("写一个文件")
+    runtime = new_session_runtime(root, context_window=200000)
     approvals = 0
-    async for ev in Agent(provider, registry, "dev", checker).run(
+    async for ev in Agent(provider, registry, "dev", checker, runtime=runtime).run(
         conv, PermissionMode.BYPASS, asyncio.Event()
     ):
         if isinstance(ev.approval, ApprovalRequest):

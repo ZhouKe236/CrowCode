@@ -10,7 +10,27 @@ import anthropic
 
 from crowcode.config import ProviderConfig
 
-from .base import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from .base import (
+    Message,
+    PromptTooLongError,
+    Request,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    Usage,
+)
+
+
+def _wrap_prompt_too_long(err: Exception) -> Exception:
+    """把 anthropic 的「上下文过长」错误包装成统一哨兵异常。"""
+    if not isinstance(err, anthropic.BadRequestError):
+        return err
+    text = str(err).lower()
+    if "prompt is too long" in text or "context length" in text:
+        wrapped = PromptTooLongError("anthropic prompt too long")
+        wrapped.__cause__ = err
+        return wrapped
+    return err
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict]:
@@ -177,4 +197,4 @@ class AnthropicProvider:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 —— 统一转成 err 事件，由上层展示
-            yield StreamEvent(err=e)
+            yield StreamEvent(err=_wrap_prompt_too_long(e))

@@ -2,3 +2,4 @@
 CLAUDE.md
 .crowcode/config.yaml
 .crowcode/settings.local.yaml
+.crowcode/sessions/

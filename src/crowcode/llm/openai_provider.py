@@ -9,7 +9,31 @@ import openai
 
 from crowcode.config import ProviderConfig
 
-from .base import Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from .base import (
+    PromptTooLongError,
+    Request,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    Usage,
+)
+
+
+def _wrap_prompt_too_long(err: Exception) -> Exception:
+    """把 openai 的「上下文过长」错误包装成统一哨兵异常。"""
+    if not isinstance(err, openai.BadRequestError):
+        return err
+    code = getattr(err, "code", None)
+    text = str(err).lower()
+    if (
+        code == "context_length_exceeded"
+        or "context_length_exceeded" in text
+        or "maximum context length" in text
+    ):
+        wrapped = PromptTooLongError("openai context length exceeded")
+        wrapped.__cause__ = err
+        return wrapped
+    return err
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict]:
@@ -153,4 +177,4 @@ class OpenAIProvider:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 —— 统一转成 err 事件，由上层展示
-            yield StreamEvent(err=e)
+            yield StreamEvent(err=_wrap_prompt_too_long(e))

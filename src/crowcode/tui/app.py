@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -20,13 +21,14 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from crowcode import __version__
 from crowcode.agent import Agent, ApprovalRequest, Phase
-from crowcode.config import ProviderConfig
+from crowcode.agent.runtime import SessionRuntime, new_session_runtime
+from crowcode.config import ProviderConfig, effective_context_window
 from crowcode.conversation import Conversation
 from crowcode.llm import Provider, new_provider
 from crowcode.permission import Outcome, PermissionChecker, PermissionMode
-from crowcode.prompt import EXECUTE_DIRECTIVE
 from crowcode.tool import Registry
 
+from .commands import dispatch_command, format_compact_notice
 from .select import build_provider_options
 from .view import (
     approval_block,
@@ -135,6 +137,7 @@ class CrowCodeApp(App):
         registry: Registry,
         checker: PermissionChecker,
         *,
+        runtime: SessionRuntime | None = None,
         mcp_server_count: int = 0,
         mcp_tool_count: int = 0,
     ) -> None:
@@ -147,6 +150,13 @@ class CrowCodeApp(App):
         self.mcp_server_count = mcp_server_count
         self.mcp_tool_count = mcp_tool_count
         self.provider: Provider | None = None
+        # 跨 run 复用的压缩状态；未注入时按当前工作目录新建一套。
+        # CLI 会显式注入 runtime；未注入时用系统临时目录，避免污染项目根目录。
+        self.runtime = runtime or new_session_runtime(
+            workspace=tempfile.gettempdir(),
+            context_window=effective_context_window(providers[0]),
+        )
+        self.agent: Agent | None = None
         self.conv = Conversation()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
         self.cur_reply = ""
@@ -203,7 +213,10 @@ class CrowCodeApp(App):
     # ── provider 选择 ──────────────────────────────────────────────
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        self.provider = new_provider(self.providers[event.option_index])
+        cfg = self.providers[event.option_index]
+        self.provider = new_provider(cfg)
+        self.agent = None
+        self.runtime.context_window = effective_context_window(cfg)
         self.state = SessionState.IDLE
         self._render_header()
         self._update_mode_label()
@@ -216,29 +229,25 @@ class CrowCodeApp(App):
 
     async def submit(self, text: str) -> None:
         text = text.strip()
-        if text == "/exit":
-            await self.action_quit()
+        if not text:
             return
-        if not text or self.state is not SessionState.IDLE:
-            return
-        log = self.query_one("#log", RichLog)
 
-        if text == "/plan":
-            self.mode = PermissionMode.PLAN
-            log.write(system_block("Entered plan mode (read-only tools)."))
-            self._update_mode_label()
+        handler, is_command = dispatch_command(text)
+        if is_command:
+            assert handler is not None
+            if self._input is not None:
+                self._input.clear()
+            await handler(self)
             return
-        if text == "/do":
-            self.mode = PermissionMode.DEFAULT
-            log.write(
-                system_block("Switched back to default mode, executing the plan.")
-            )
-            self.conv.add_user(EXECUTE_DIRECTIVE)
-            self._update_mode_label()
-        else:
-            self.conv.add_user(text)
-            log.write(user_block(text))
 
+        if self.state is not SessionState.IDLE:
+            return
+        self.conv.add_user(text)
+        self.query_one("#log", RichLog).write(user_block(text))
+        await self._begin_turn()
+
+    async def _begin_turn(self) -> None:
+        """启动一轮 Agent Loop（命令路径可复用，不写入用户消息）。"""
         assert self.provider is not None
         assert self._input is not None
         self._input.clear()
@@ -253,13 +262,28 @@ class CrowCodeApp(App):
         self._stream_task = asyncio.create_task(self._consume_agent_events())
         self._timer = self.set_interval(0.1, self._tick)
 
+    def _ensure_agent(self) -> Agent:
+        """按需构造一次 Agent；跨 run 复用其压缩状态。"""
+        if self.agent is None:
+            assert self.provider is not None
+            self.agent = Agent(
+                self.provider,
+                self._tool_registry,
+                __version__,
+                self.checker,
+                runtime=self.runtime,
+            )
+        return self.agent
+
     async def _consume_agent_events(self) -> None:
-        assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(self.provider, self._tool_registry, __version__, self.checker)
+        agent = self._ensure_agent()
         log = self.query_one("#log", RichLog)
         try:
             async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
+                if ev.compact is not None:
+                    log.write(system_block(format_compact_notice(ev.compact)))
+                    continue
                 if ev.approval is not None:
                     # 人在回路：进入待批准态，暂停读取后续事件（agent 正 await respond）。
                     self.pending = ev.approval
@@ -458,6 +482,7 @@ def run(
     registry: Registry,
     checker: PermissionChecker,
     *,
+    runtime: SessionRuntime | None = None,
     mcp_server_count: int = 0,
     mcp_tool_count: int = 0,
 ) -> None:
@@ -466,6 +491,7 @@ def run(
         providers,
         registry,
         checker,
+        runtime=runtime,
         mcp_server_count=mcp_server_count,
         mcp_tool_count=mcp_tool_count,
     ).run()

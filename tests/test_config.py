@@ -4,7 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from crowcode.config import ConfigError, load, load_with_fallback
+from crowcode.config import (
+    DEFAULT_ANTHROPIC_CONTEXT_WINDOW,
+    DEFAULT_OPENAI_CONTEXT_WINDOW,
+    ConfigError,
+    ProviderConfig,
+    effective_context_window,
+    load,
+    load_with_fallback,
+)
 
 
 def _write(tmp_path, text: str) -> str:
@@ -208,6 +216,65 @@ providers:
     )
     with pytest.raises(ConfigError, match="不能为空"):
         load_with_fallback(str(project))
+
+
+def test_context_window_decoded(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+providers:
+  - {protocol: anthropic, api_key: k, model: m, context_window: 80000}
+""",
+    )
+    cfg = load(path)
+    assert cfg.providers[0].context_window == 80000
+
+
+def test_context_window_invalid(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+providers:
+  - {protocol: anthropic, api_key: k, model: m, context_window: -1}
+""",
+    )
+    with pytest.raises(ConfigError, match="context_window"):
+        load(path)
+
+
+def test_effective_context_window_unconfigured():
+    p = ProviderConfig(protocol="anthropic", api_key="k", model="m")
+    assert effective_context_window(p) == DEFAULT_ANTHROPIC_CONTEXT_WINDOW == 200000
+
+
+def test_effective_context_window_zero():
+    p = ProviderConfig(protocol="openai", api_key="k", model="m", context_window=0)
+    assert effective_context_window(p) == DEFAULT_OPENAI_CONTEXT_WINDOW == 128000
+
+
+def test_effective_context_window_positive():
+    p = ProviderConfig(
+        protocol="anthropic", api_key="k", model="m", context_window=80000
+    )
+    assert effective_context_window(p) == 80000
+
+
+def test_effective_context_window_unknown_protocol():
+    p = ProviderConfig(
+        protocol="other",  # type: ignore[arg-type]
+        api_key="k",
+        model="m",
+    )
+    assert effective_context_window(p) == 200000
+
+
+def test_config_example_parses():
+    import yaml
+
+    raw = yaml.safe_load(
+        Path(".crowcode/config.yaml.example").read_text(encoding="utf-8")
+    )
+    assert isinstance(raw, dict)
 
 
 def test_user_config_can_contain_mcp_servers(home, tmp_path):
